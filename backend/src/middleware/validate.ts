@@ -200,13 +200,13 @@ function mapIssueCode(issue: ZodIssue): string {
   switch (issue.code) {
     case 'invalid_type':
       return 'INVALID_TYPE';
-    case 'invalid_string':
+    case 'invalid_format':
       return 'INVALID_STRING';
     case 'too_small':
       return 'VALUE_TOO_SMALL';
     case 'too_big':
       return 'VALUE_TOO_BIG';
-    case 'invalid_enum_value':
+    case 'invalid_value':
       return 'INVALID_ENUM_VALUE';
     case 'unrecognized_keys':
       return 'UNRECOGNIZED_KEYS';
