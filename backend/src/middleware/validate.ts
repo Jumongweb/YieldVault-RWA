@@ -122,9 +122,7 @@ export const WebhookRegisterSchema = z
         { message: 'url must be a valid http or https URL' },
       ),
     eventTypes: z
-      .array(z.enum(WEBHOOK_EVENT_TYPES), {
-        invalid_type_error: 'eventTypes must be an array of valid event type strings',
-      })
+      .array(z.enum(WEBHOOK_EVENT_TYPES))
       .min(1, 'eventTypes must contain at least one event type')
       .optional(),
     enabled: z.boolean().optional(),
@@ -202,13 +200,13 @@ function mapIssueCode(issue: ZodIssue): string {
   switch (issue.code) {
     case 'invalid_type':
       return 'INVALID_TYPE';
-    case 'invalid_format':
+    case 'invalid_string':
       return 'INVALID_STRING';
     case 'too_small':
       return 'VALUE_TOO_SMALL';
     case 'too_big':
       return 'VALUE_TOO_BIG';
-    case 'invalid_value':
+    case 'invalid_enum_value':
       return 'INVALID_ENUM_VALUE';
     case 'unrecognized_keys':
       return 'UNRECOGNIZED_KEYS';
