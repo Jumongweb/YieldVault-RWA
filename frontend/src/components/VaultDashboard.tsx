@@ -1,3 +1,6 @@
+import React, { useEffect, useState } from "react";
+import { Activity, ShieldCheck, TrendingUp, Wallet as WalletIcon } from "./icons";
+import { AlertTriangle, Info } from "lucide-react";
 import React, { useEffect, useRef, useState } from "react";
 import { ArrowDownUp, ArrowUpRight, Clock3, Menu, X } from "lucide-react";
 import {
@@ -18,12 +21,17 @@ import SharePriceDisplay from "./SharePriceDisplay";
 import VaultPerformanceChart from "./VaultPerformanceChart";
 import { useToast } from "../context/ToastContext";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./Tabs";
+import { FormField, SubmitButton } from "../forms";
+import CopyButton from "./CopyButton";
+import { useDepositMutation, useWithdrawMutation } from "../hooks/useVaultMutations";
+import TransactionStatusModal from "./TransactionStatusModal";
 import { FormField } from "../forms";
 import { isApiError, isValidationError } from "../lib/api";
 import { useForm } from "../forms/useForm";
-import type { ValidationSchema } from "../forms/validate";
+import { validate, type ValidationSchema } from "../forms/validate";
 import { useDepositMutation, useWithdrawMutation } from "../hooks/useVaultMutations";
 import { useTokenAllowance } from "../hooks/useTokenAllowance";
+import { usePortfolioHoldings } from "../hooks/usePortfolioData";
 import { createDepositFormSchema, MIN_DEPOSIT_AMOUNT } from "../forms/schemas/depositFormSchema";
 import { createWithdrawFormSchema } from "../forms/schemas/withdrawFormSchema";
 import { mapServerError } from "../lib/errorMappers";
@@ -194,11 +202,32 @@ const VaultCapWarning: React.FC<{ utilization: number; isReached: boolean }> = (
   );
 };
 
+function buildFakeTxHash(walletAddress: string, action: "deposit" | "withdraw", amount: number): string {
+  const seed = `${walletAddress}-${action}-${amount.toFixed(2)}-${Date.now()}`;
+  let hash = "";
+  for (let i = 0; i < 64; i += 1) {
+    const code = seed.charCodeAt(i % seed.length);
+    hash += ((code + i * 13) % 16).toString(16);
+  }
+  return hash;
+}
+
+
+
 const VaultDashboard: React.FC<VaultDashboardProps> = ({
   walletAddress,
   usdcBalance = 0,
   xlmBalance = 0,
 }) => {
+  const { formattedTvl, formattedApy, summary, error, isLoading, utilization, isCapReached, isCapWarning } = useVault();
+  const toast = useToast();
+  const [activeTab, setActiveTab] = useState<"deposit" | "withdraw">("deposit");
+  const [amount, setAmount] = useState("");
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [modalTxHash, setModalTxHash] = useState<string | null>(null);
+  const [modalAmount, setModalAmount] = useState(0);
+  const [modalActionType, setModalActionType] = useState<"deposit" | "withdraw">("deposit");
+  const [modalError, setModalError] = useState<string | null>(null);
   const navigate = useNavigate();
   const dashboardUrl = useDashboardUrlState();
   const {
@@ -224,7 +253,16 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
   });
   const { isStale: statsIsStale, ageText: statsAgeText } = useStaleIndicator(lastUpdate);
 
-  const availableBalance = walletAddress ? usdcBalance : 0;
+  const { data: portfolioHoldings } = usePortfolioHoldings(walletAddress);
+
+  // Deposit balance comes from the connected wallet's USDC balance; withdraw
+  // balance is the user's current vault position (sum of holdings value).
+  const depositBalance = walletAddress ? usdcBalance : 0;
+  const withdrawBalance = walletAddress
+    ? (portfolioHoldings ?? []).reduce((sum, holding) => sum + holding.valueUsd, 0)
+    : 0;
+  const availableBalance =
+    dashboardUrl.state.tab === "deposit" ? depositBalance : withdrawBalance;
 
   // Wizard state
   const [transactionResult, setTransactionResult] = useState<{
@@ -271,11 +309,11 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
   // Create validation schema based on transaction type and current state
   const transactionSchema = React.useMemo<ValidationSchema<{ amount: string }>>(() => {
     if (dashboardUrl.state.tab === "deposit") {
-      return createDepositFormSchema(availableBalance, isCapReached, xlmBalance, feeXlm);
+      return createDepositFormSchema(depositBalance, isCapReached, xlmBalance, feeXlm);
     } else {
-      return createWithdrawFormSchema(availableBalance);
+      return createWithdrawFormSchema(withdrawBalance, xlmBalance, feeXlm);
     }
-  }, [dashboardUrl.state.tab, availableBalance, isCapReached, xlmBalance, feeXlm]);
+  }, [dashboardUrl.state.tab, depositBalance, withdrawBalance, isCapReached, xlmBalance, feeXlm]);
 
   const {
     values,
@@ -286,7 +324,16 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
     setValues,
     setFieldError,
     resetErrors,
+    validateAll,
   } = useForm({ amount: dashboardUrl.state.amount }, transactionSchema);
+
+  // Validation computed against the full schema regardless of touched state,
+  // so the primary CTA can be disabled proactively (before the user blurs
+  // the field) instead of only reacting to already-surfaced inline errors.
+  const liveValidationErrors = React.useMemo(
+    () => validate(transactionSchema, values),
+    [transactionSchema, values],
+  );
 
   const amount = values.amount;
   const activeTab = dashboardUrl.state.tab;
@@ -383,6 +430,9 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
       : null;
   const isBusy = isProcessing !== null;
 
+  const isBusy = isProcessing !== null;
+
+  const availableBalance = walletAddress ? usdcBalance : 0;
   const strategy = summary.strategy;
   const enteredAmount = Number(amount);
   const activeAmountError = errors.amount;
@@ -398,8 +448,8 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
   const isSubmitDisabled =
     !walletAddress ||
     isBusy ||
-    Boolean(activeAmountError) ||
     !amount ||
+    Object.keys(liveValidationErrors).length > 0 ||
     (dashboardUrl.state.tab === "deposit" && isCapReached);
 
   const riskItems = React.useMemo<RiskAction[]>(() => {
@@ -523,10 +573,10 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
   };
 
   const goToReview = () => {
-    if (Object.keys(errors).length > 0) {
+    if (!validateAll()) {
       toast.warning({
         title: t("vaultDashboard.toast.validationErrorTitle"),
-        description: errors.amount || t("vaultDashboard.toast.invalidAmount"),
+        description: liveValidationErrors.amount || t("vaultDashboard.toast.invalidAmount"),
       });
       formFocus.focusFirstError();
       return;
@@ -553,6 +603,17 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
       return;
     }
 
+    setModalAmount(value);
+    setModalActionType(actionType);
+    setModalError(null);
+    setModalTxHash(null);
+    setIsModalOpen(true);
+
+    try {
+      // Simulate Freighter signature delay
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      const hash = buildFakeTxHash(walletAddress, actionType, value);
+      setModalTxHash(hash);
     if (!options.isRetry) {
       setRetryCount(0);
     }
@@ -657,6 +718,8 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
             ? t("vaultDashboard.depositMessage").replace("{{amount}}", value.toFixed(2))
             : t("vaultDashboard.withdrawMessage").replace("{{amount}}", value.toFixed(2)),
       });
+    } catch (err: any) {
+      setModalError(err.message || "An error occurred during the transaction.");
     } catch (err: unknown) {
       if (isTransactionConflict(err)) {
         setActiveConflict({
@@ -1119,7 +1182,9 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
 
             <StepIndicator currentStep={dashboardUrl.state.step} />
 
-            {(["deposit", "withdraw"] as const).map((tab) => (
+            {(["deposit", "withdraw"] as const).map((tab) => {
+              const tabBalance = tab === "deposit" ? depositBalance : withdrawBalance;
+              return (
               <TabsContent key={tab} value={tab}>
                 {(isCapReached || isCapWarning) && tab === "deposit" && (
                   <VaultCapWarning utilization={utilization} isReached={isCapReached} />
@@ -1138,7 +1203,7 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
                               {tab === "deposit" ? t("vaultDashboard.amountToDeposit") : t("vaultDashboard.amountToWithdraw")}
                             </div>
                             <div style={{ color: "var(--text-secondary)", fontSize: "0.85rem" }}>
-                              {t("vaultDashboard.balanceLabel")} <span style={{ color: "var(--text-primary)", fontWeight: 600 }}>{availableBalance.toFixed(2)}</span>
+                              {t("vaultDashboard.balanceLabel")} <span style={{ color: "var(--text-primary)", fontWeight: 600 }}>{tabBalance.toFixed(2)}</span>
                             </div>
                           </div>
 
@@ -1154,7 +1219,7 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
                             onBlur={handleBlur}
                             disabled={isBusy || (tab === "deposit" && isCapReached)}
                             error={showInlineError ? activeAmountError ?? undefined : undefined}
-                            helperText={tab === "deposit" ? t("vaultDashboard.minDeposit").replace("{{amount}}", MIN_DEPOSIT_AMOUNT.toFixed(2)) : t("vaultDashboard.maxWithdraw").replace("{{amount}}", availableBalance.toFixed(2))}
+                            helperText={tab === "deposit" ? t("vaultDashboard.minDeposit").replace("{{amount}}", MIN_DEPOSIT_AMOUNT.toFixed(2)) : t("vaultDashboard.maxWithdraw").replace("{{amount}}", tabBalance.toFixed(2))}
                             className={isValidAmount ? "input-valid" : ""}
                           />
 
@@ -1199,11 +1264,13 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
                               id={`vault-${tab}-max`}
                               className="btn-max"
                               onClick={() => {
-                                setValues({ amount: availableBalance.toFixed(2) });
+                                const nextValues = { amount: tabBalance.toFixed(2) };
+                                setValues(nextValues);
+                                validateAll(nextValues);
                               }}
                               disabled={
                                 !walletAddress ||
-                                availableBalance <= 0 ||
+                                tabBalance <= 0 ||
                                 isBusy ||
                                 (tab === "deposit" && isCapReached)
                               }
@@ -1260,7 +1327,7 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
                                   />
                                 </span>
                                 <span style={{ fontSize: "0.9rem", fontWeight: 600, color: "var(--accent-cyan)" }}>
-                                  ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°Ãƒâ€¹Ã¢â‚¬Â  {estimatedNetAmount.toFixed(2)} yvUSDC
+                                  ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â°ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â  {estimatedNetAmount.toFixed(2)} yvUSDC
                                 </span>
                               </div>
                             )}
@@ -1440,7 +1507,7 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
                                   userSelect: "none",
                                 }}
                               >
-                                <span style={{ fontSize: "1.2em" }}>ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã‚Â¡ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã‚Â¯Ãƒâ€šÃ‚Â¸Ãƒâ€šÃ‚Â</span>
+                                <span style={{ fontSize: "1.2em" }}>ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â</span>
                                 Advanced Settings
                                 <span style={{ marginLeft: "auto", fontSize: "0.7rem", color: "var(--text-secondary)" }}>
                                   Optional
@@ -1662,6 +1729,58 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
                           </Button>
                         </div>
                       </div>
+                    </div>
+
+                    <FormField
+                      label={tab === "deposit" ? "Deposit amount" : "Withdrawal amount"}
+                      name={`${tab}-amount`}
+                      type="number"
+                      placeholder="0.00"
+                      value={amount}
+                      onChange={(event) => setAmount(event.target.value)}
+                      disabled={isBusy || (tab === "deposit" && isCapReached)}
+                    />
+
+                    <div className="flex justify-between items-center" style={{ margin: "16px 0 24px" }}>
+                      <span style={{ color: "var(--text-secondary)", fontSize: "0.85rem" }}>Asset: USDC</span>
+                      <button
+                        type="button"
+                        className="btn btn-outline"
+                        onClick={() => setAmount(availableBalance.toFixed(2))}
+                        disabled={!walletAddress || availableBalance <= 0 || isBusy || (tab === "deposit" && isCapReached)}
+                      >
+                        MAX
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="glass-panel" style={{ padding: "14px 16px", background: "rgba(0, 0, 0, 0.15)", marginBottom: "16px" }}>
+                    <div className="flex justify-between items-center" style={{ marginBottom: "6px" }}>
+                      <span style={{ color: "var(--text-secondary)", fontSize: "0.86rem" }}>Estimated protocol fee</span>
+                      <span style={{ fontSize: "0.9rem", fontWeight: 600 }}>
+                        {isValidAmount ? `${estimatedFee.toFixed(4)} USDC` : "0.0000 USDC"}
+                      </span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span style={{ color: "var(--text-secondary)", fontSize: "0.82rem" }}>
+                        {tab === "deposit" ? "Estimated net deposit" : "Estimated net withdrawal"}
+                      </span>
+                      <span style={{ fontSize: "0.9rem", fontWeight: 600 }}>
+                        {isValidAmount ? `${estimatedNetAmount.toFixed(4)} USDC` : "0.0000 USDC"}
+                      </span>
+                    </div>
+                    <div style={{ marginTop: "6px", color: "var(--text-secondary)", fontSize: "0.75rem" }}>
+                      Network fee: {summary.networkFeeEstimate}
+                    </div>
+                  </div>
+
+                  <SubmitButton
+                    loading={isBusy && activeTab === tab}
+                    disabled={!walletAddress || isBusy || !amount || Number(amount) <= 0 || (tab === "deposit" && isCapReached)}
+                    label={tab === "deposit" ? (isCapReached ? "Vault is full" : "Approve & Deposit") : "Withdraw Funds"}
+                    loadingLabel="Processing Transaction..."
+                  />
+                </form>
                     )}
 
                     {dashboardUrl.state.step === "result" && (
@@ -1732,7 +1851,8 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
                     )}
                   </div>
               </TabsContent>
-            ))}
+              );
+            })}
           </Tabs>
         </div>
         <div className="mobile-vault-actions">
@@ -1742,6 +1862,14 @@ const VaultDashboard: React.FC<VaultDashboardProps> = ({
           </button>
         </div>
       </div>
+      <TransactionStatusModal
+        isOpen={isModalOpen}
+        onClose={() => setIsModalOpen(false)}
+        txHash={modalTxHash}
+        actionType={modalActionType}
+        amount={modalAmount}
+        error={modalError}
+      />
       {mobileActionsOpen && (
         <div className="mobile-bottom-sheet" role="dialog" aria-modal="true" aria-label={t("vaultDashboard.quickVaultActionsAria")}>
           <button
